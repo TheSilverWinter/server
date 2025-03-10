@@ -5,180 +5,214 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <fcntl.h>
-#include <sys/time.h>
 
-#define TFTP_PORT 69        // Port utilisé
-#define PACKET_SIZE 516     // Taille max d'un package
-#define DATA_SIZE 512       // Taille max du paquet de données
-#define OP_RRQ 1            // OP code demande lecture
-#define OP_WRQ 2            // OP code demande écriture
-#define OP_DATA 3           // OP code paquet de données
-#define OP_ACK 4            // Signal attendu
-#define OP_ERROR 5          // Signal d'erreur
-#define MAX_RETRIES 5       // Nombre maximal de tentatives de retransmission
-#define TIMEOUT 2           // Timeout en secondes
+#define SERVER_PORT 6969      
+#define PACKET_SIZE 516
+#define DATA_SIZE 512
+#define MAX_RETRIES 5 
+#define TIMEOUT 2 
 
-/* Variables utilisées :
-- sock = socket
-- buffer[] = buffer dans lequel on stocke 4 bytes + 512 bytes de données
-- ack[] = réponse du serveur
-- block = numéro de bloc de données
-- opcode = 1 ou 2 (RRQ ou WRQ)
-- filename = fichier à manipuler (lire/écrire)
-- len = longueur du packet de données
-- server_addr = connexion réseau
-- addr_len = taille de (la structure) server_addr
-*/
+#define OP_RRQ 1 
+#define OP_WRQ 2      
+#define OP_DATA 3 
+#define OP_ACK 4 
+#define OP_ERROR 5 
 
-// Fonction pour configurer le timeout
+// Configure un timeout de réception sur la socket
 void set_timeout(int sock) {
-    struct timeval timeout = {TIMEOUT, 0};  // Timeout de 2 secondes
+    struct timeval timeout = {TIMEOUT, 0};  // Timeout de 2 secondes.
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
 }
 
-// Fonction pour envoyer la requête au serveur
+// Construit et envoie la requête initiale (WRQ ou RRQ)
 void send_request(int sock, struct sockaddr_in *server_addr, const char *filename, int opcode) {
     char buffer[PACKET_SIZE];
+    // Construit le paquet : 0, opcode, nom_du_fichier, 0, "octet", 0
+    // Attention : ici sprintf est utilisé pour simplifier, mais dans un contexte binaire il faut veiller aux caractères NUL.
     int len = sprintf(buffer, "%c%c%s%c%s%c", 0, opcode, filename, 0, "octet", 0);
-	printf("Requête envoyée: %s\n", buffer);  // Afficher la requête envoyée
-
-    if(opcode == OP_WRQ){
-        printf("Requête WRQ pour le fichier: %s\n", filename);
-    } else {
-        printf("Requête RRQ pour le fichier: %s\n", filename);
-    }
     
-    sendto(sock, buffer, len, 0, (struct sockaddr *)server_addr, sizeof(*server_addr));  // Envoi de la requête au serveur
+    printf("Envoi de la requête %s pour le fichier : %s\n",
+           (opcode == OP_WRQ) ? "WRQ" : "RRQ", filename);
+    
+    sendto(sock, buffer, len, 0, (struct sockaddr *)server_addr, sizeof(*server_addr));
 }
 
-// Fonction pour envoyer les données (WRQ)
-void send_data(int sock, struct sockaddr_in *server_addr, FILE *file) {
+// Pour une requête de lecture (RRQ) : réception et écriture dans le fichier local.
+void receive_file(int sock, struct sockaddr_in *server_addr, const char *filename) {
     char buffer[PACKET_SIZE];
-    int block = 1, bytes_read, addr_len = sizeof(*server_addr);
-    char ack[4];
-    int retries;
-
-    // Attente de l'ACK initial du serveur
-    while (recvfrom(sock, ack, 4, 0, (struct sockaddr *)server_addr, &addr_len) < 4) {
-        printf("Erreur, ACK non reçus\n");
-    }
-
-    if (ack[1] != OP_ACK || ack[2] != 0 || ack[3] != 0) {  // Vérifie la réponse du serveur
-        printf("Erreur de la réponse du serveur\n");
+    socklen_t addr_len = sizeof(*server_addr);
+    
+    // Réception du premier paquet depuis le serveur (DATA ou ERROR)
+    int bytes_received = recvfrom(sock, buffer, PACKET_SIZE, 0,
+                                  (struct sockaddr *)server_addr, &addr_len);
+    if (bytes_received < 4) {
+        perror("recvfrom (initial RRQ)");
         return;
     }
-    printf("ACK reçus\n");
-
-    // Envoi des blocs de données
-    while ((bytes_read = fread(buffer + 4, 1, DATA_SIZE, file)) > 0) {
-        buffer[0] = 0;
-        buffer[1] = OP_DATA;
-        buffer[2] = (block >> 8) & 0xFF;  // Numéro du bloc (octet gauche)
-        buffer[3] = block & 0xFF;         // Numéro du bloc (octet droit)
-
-        printf("Sending block %d with %d bytes\n", block, bytes_read);
-
-        retries = 0;
-        // Tentatives de retransmission en cas de perte de paquet
-        while (retries < MAX_RETRIES) {
-            sendto(sock, buffer, bytes_read + 4, 0, (struct sockaddr *)server_addr, addr_len);  // Envoi des données
-            printf("Bloc %d envoyé, attente du ACK\n", block);
-            
-            // Attente de l'ACK du serveur avec timeout
-            if (recvfrom(sock, ack, 4, 0, (struct sockaddr *)server_addr, &addr_len) >= 4) {
-                // Si ACK reçu, on sort de la boucle de retransmission
-                if (ack[1] == OP_ACK && ack[2] == (block >> 8) && ack[3] == (block & 0xFF)) {
-                    printf("ACK reçus pour le bloc %d\n", block);
-                    break;
-                }
-            } else {
-                // Si pas d'ACK reçu, on réessaie
-                printf("ACK non reçus (%d/%d)\n", ++retries, MAX_RETRIES);
-            }
-        }
-
-        // Si on dépasse le nombre de tentatives, on annule
-        if (retries == MAX_RETRIES) {
-            printf("ACK non reçus pour le bloc %d arpès %d essais\n", block, MAX_RETRIES);
-            return;
-        }
-
-        block++;  // On passe au bloc suivant
+    
+    // Vérifier si le paquet est une erreur (OP_ERROR)
+    uint16_t opcode = (((unsigned char)buffer[0]) << 8) | ((unsigned char)buffer[1]);
+    if (opcode == OP_ERROR) {
+        uint16_t error_code = (((unsigned char)buffer[2]) << 8) | ((unsigned char)buffer[3]);
+        fprintf(stderr, "Erreur du serveur: code %d, message: %s\n", error_code, buffer + 4);
+        return;
     }
-
-    printf("Transfer finis\n");
-}
-
-// Fonction pour recevoir le fichier (RRQ)
-void receive_file(int sock, struct sockaddr_in *server_addr, const char *filename) {
-    FILE *file = fopen(filename, "wb");  // Ouverture du fichier à écrire
-    char buffer[PACKET_SIZE], ack[4] = {0, OP_ACK, 0, 0};
-    int bytes_received, addr_len = sizeof(*server_addr), block = 1;
-    int retries;
-
-    // Réception des blocs de données
+    
+    // Mise à jour de la connexion : on se connecte sur la socket au port indiqué par le serveur
+    if (connect(sock, (struct sockaddr *)server_addr, addr_len) < 0) {
+        perror("connect (RRQ)");
+        return;
+    }
+    printf("Connexion établie vers %s:%d\n", inet_ntoa(server_addr->sin_addr), ntohs(server_addr->sin_port));
+    
+    // Ouvre le fichier local en écriture
+    FILE *file = fopen(filename, "wb");
+    if (!file) {
+        perror("fopen (RRQ fichier local)");
+        return;
+    }
+    
+    int block = 1;
     do {
-        retries = 0;
-        while ((bytes_received = recvfrom(sock, buffer, PACKET_SIZE, 0, (struct sockaddr *)server_addr, &addr_len)) < 4) {
-            // Si pas assez de données reçues, on réessaie
-            if (++retries > MAX_RETRIES) {
-                printf("Packet perdu.\n");
-                fclose(file);
-                return;
-            }
-            printf("Packet Perdu, nouvelle tentative (%d/%d)\n", retries, MAX_RETRIES);
+        uint16_t block_received = (((unsigned char)buffer[2]) << 8) | ((unsigned char)buffer[3]);
+        printf("Reçu bloc %d avec %d octets\n", block_received, bytes_received - 4);
+        fwrite(buffer + 4, 1, bytes_received - 4, file);
+        fflush(file);
+        
+        // Prépare et envoie l'ACK pour le bloc reçu
+        unsigned char ack[4] = {0, OP_ACK, buffer[2], buffer[3]};
+        send(sock, ack, 4, 0);
+        printf("Envoi de l'ACK pour le bloc %d\n", block_received);
+        
+        // Si la taille des données est inférieure à DATA_SIZE, c'est le dernier bloc.
+        if ((bytes_received - 4) < DATA_SIZE)
+            break;
+        
+        // Réception du bloc suivant (la socket est connectée, on utilise recv())
+        bytes_received = recv(sock, buffer, PACKET_SIZE, 0);
+        if (bytes_received < 0) {
+            perror("recv (RRQ DATA)");
+            break;
         }
-
-        printf("Bloc %d reçus (%d bytes)\n", block, bytes_received - 4);
-        fwrite(buffer + 4, 1, bytes_received - 4, file);  // Ecriture des données dans le fichier
-        
-        ack[2] = buffer[2];
-        ack[3] = buffer[3];
-        
-        // Envoi de l'ACK pour le bloc reçu
-        sendto(sock, ack, 4, 0, (struct sockaddr *)server_addr, addr_len);
-        printf("ACK envoyé pour le bloc %d\n", block);
-        
-        block++;  // On passe au bloc suivant
-    } while (bytes_received == PACKET_SIZE);  // Si le paquet était complet, on attend le bloc suivant
-
-    printf("Fin de la reception.\n");
+        block++;
+    } while (1);
+    
+    printf("Réception du fichier terminée.\n");
     fclose(file);
 }
 
+// Envoi du fichier pour une requête d'écriture (WRQ)
+void send_data(int sock, struct sockaddr_in *server_addr, FILE *file) {
+    char buffer[PACKET_SIZE];
+    int block = 1, bytes_read, retries;
+    char ack[PACKET_SIZE];  // élargi pour pouvoir lire un message d'erreur
+    socklen_t addr_len = sizeof(*server_addr);
+    
+    // Boucle de réception de l'ACK initial depuis un port autre que SERVER_PORT
+    retries = 0;
+    while (1) {
+        int ret = recvfrom(sock, ack, sizeof(ack), 0, (struct sockaddr *)server_addr, &addr_len);
+        if (ret >= 4) {
+            // Si c'est un paquet d'erreur, l'afficher et quitter
+            if ( (unsigned char)ack[1] == OP_ERROR ) {
+                fprintf(stderr, "Erreur du serveur : %s\n", ack + 4);
+                return;
+            }
+            // Si le paquet vient du port bien connu, on l'ignore
+            if (server_addr->sin_port == htons(SERVER_PORT)) {
+                printf("ACK initial reçu depuis le port %d (port bien connu), ignoré...\n", ntohs(server_addr->sin_port));
+                continue;
+            }
+            break;
+        }
+        if (++retries > MAX_RETRIES) {
+            printf("Erreur : pas d'ACK initial reçu, annulation.\n");
+            return;
+        }
+        printf("Attente de l'ACK initial, tentative %d/%d\n", retries, MAX_RETRIES);
+    }
+    printf("ACK initial reçu. Connexion établie vers %s:%d\n",
+           inet_ntoa(server_addr->sin_addr), ntohs(server_addr->sin_port));
+    
+    // Se connecter sur la socket pour que les paquets suivants soient envoyés vers le bon port
+    if (connect(sock, (struct sockaddr *)server_addr, addr_len) < 0) {
+        perror("connect (WRQ)");
+        return;
+    }
+    
+    while ((bytes_read = fread(buffer + 4, 1, DATA_SIZE, file)) > 0) {
+        buffer[0] = 0;
+        buffer[1] = OP_DATA;
+        buffer[2] = (block >> 8) & 0xFF;
+        buffer[3] = block & 0xFF;
+
+        retries = 0;
+        do {
+            send(sock, buffer, bytes_read + 4, 0);
+            printf("Envoi du bloc %d (%d octets)\n", block, bytes_read);
+            int ret = recv(sock, ack, sizeof(ack), 0);
+            if (ret >= 4) {
+                // Vérifier si on a reçu un paquet d'erreur
+                if ((unsigned char)ack[1] == OP_ERROR) {
+                    fprintf(stderr, "Erreur du serveur lors de l'envoi du bloc %d : %s\n", block, ack + 4);
+                    return;
+                }
+                break;
+            }
+            printf("ACK non reçu, réessai %d/%d\n", ++retries, MAX_RETRIES);
+        } while (retries < MAX_RETRIES);
+
+        if (retries == MAX_RETRIES) {
+            printf("Erreur : le bloc %d n'a pas été confirmé, annulation.\n", block);
+            return;
+        }
+        printf("ACK reçu pour le bloc %d\n", block);
+        block++;
+    }
+    
+    printf("Transfert de fichier terminé.\n");
+}
+
+
 int main(int argc, char *argv[]) {
     if (argc != 4) {
-        printf("Usage: %s <server_ip> <WRQ|RRQ> <filename>\n", argv[0]);
+        printf("Utilisation : %s <IP serveur> <WRQ|RRQ> <fichier>\n", argv[0]);
         return 1;
     }
-
+    
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        perror("socket");
+        return 1;
+    }
+    
     struct sockaddr_in server_addr = {0};
-    server_addr.sin_family = AF_INET;  // Définition IPv4
-    server_addr.sin_port = htons(TFTP_PORT);  // Définition du Port
-    inet_pton(AF_INET, argv[1], &server_addr.sin_addr);  // Définition de l'adresse IP
-
-    printf("Connection au server TFTP %s\n", argv[1]);
-    int opcode = 1;
-    if (strcmp(argv[2], "WRQ") == 0) opcode = OP_WRQ;
-
-    set_timeout(sock);  // Activation du timeout pour la socket
-
-    send_request(sock, &server_addr, argv[3], opcode);  // Demande au serveur pour lire/écrire
-
-    if (opcode == OP_WRQ) {  // Si WRQ, on envoie les données
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(SERVER_PORT);
+    inet_pton(AF_INET, argv[1], &server_addr.sin_addr);
+    
+    set_timeout(sock);
+    
+    int opcode = (strcmp(argv[2], "WRQ") == 0) ? OP_WRQ : OP_RRQ;
+    
+    // Envoi de la requête initiale
+    send_request(sock, &server_addr, argv[3], opcode);
+    
+    if (opcode == OP_WRQ) {
+        // WRQ : envoi du fichier
         FILE *file = fopen(argv[3], "rb");
         if (!file) {
-            perror("Fichier");
+            perror("Erreur ouverture fichier");
             return 1;
         }
         send_data(sock, &server_addr, file);
         fclose(file);
-    } else {  // Si RRQ, on reçoit les données
+    } else {
+        // RRQ : réception du fichier
         receive_file(sock, &server_addr, argv[3]);
     }
-
-    printf("TFTP Fini.\n");
+    
     close(sock);
     return 0;
 }
+
